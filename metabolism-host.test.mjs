@@ -11,6 +11,8 @@ const load = packageName => import(pathToFileURL(resolve(installed, packageName,
 const { Session } = await load('dsh-session');
 const { createToolResultMessage, createUserMessage } = await load('dsh-llm');
 
+const sessionObservers = new WeakMap();
+
 function runtime(session, enabled = true) {
   const handlers = new Map();
   let definition;
@@ -28,6 +30,7 @@ function runtime(session, enabled = true) {
     tokenMeter: { estimateMessage: message => JSON.stringify(message.content).length },
     logger: { warn: assert.fail },
   }, { sessionId: session.id, enabled });
+  sessionObservers.set(session, handlers);
   return {
     agent,
     get tool() { return definition; },
@@ -42,15 +45,19 @@ function runtime(session, enabled = true) {
   };
 }
 
-function result(session, turn, name, args, value, isError = false) {
+function result(session, turn, name, args, value, isError = false, step = 1) {
   const callId = `call-${session.seq}`;
-  const call = session.append('tool/call', { turn, step: 1, callId, name, arguments: JSON.stringify(args) });
-  return session.append('tool/result', { turn, step: 1, message: createToolResultMessage({
+  const call = session.append('tool/call', { turn, step, callId, name, arguments: JSON.stringify(args) });
+  return session.append('tool/result', { turn, step, message: createToolResultMessage({
     callId, content: [{ type: 'text', text: value }], isError,
   }) }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] });
 }
 
-const finish = (session, turn, kind = 'completed') => session.append('turn/end', { turn, reason: { kind } });
+async function finish(session, turn, kind = 'completed') {
+  const event = session.append('turn/end', { turn, reason: { kind } });
+  sessionObservers.get(session)?.get('session/event')?.(session, event);
+  await Promise.resolve();
+}
 
 test('all-agent mode registers existing and newly created agents and settles each independently', async () => {
   const handlers = new Map();
@@ -83,8 +90,9 @@ test('all-agent mode registers existing and newly created agents and settles eac
   for (const agent of [existing, created]) {
     await next(agent, 1);
     result(agent.session, 1, 'read_log', {}, raw);
-    finish(agent.session, 1);
-    assert(!has(await next(agent, 2), raw));
+    sessionObservers.set(agent.session, handlers);
+    await finish(agent.session, 1);
+    assert(!has(agent.session.deriveMessages(), raw));
   }
   dispose();
   assert.equal(definitions.size, 0);
@@ -113,10 +121,83 @@ test('reads shadowed history, pages text, and retains only the distilled noteboo
   assert.throws(() => host.tool.execute({ ...read, seq: session.seq }, { agent: host.agent }), /文字原文/);
   const note = { action: 'remember', key: 'history-check', seq: receipt.seq, note: '按事件号核对原文。' };
   changeMarks(host, 1, note);
-  finish(session, 1);
+  await finish(session, 1);
   assert(has(await host.next(2), `[工具结果已代谢，原事件 ${receipt.seq}]`));
   const restored = runtime(Session.create(session.id, session.snapshotEvents()));
   assert.match(restored.notebook(), /按事件号核对原文/);
+});
+
+test('looks up tool calls by turn and reads the stable original reference after metabolism and replay', async () => {
+  const session = Session.create('session-history-table');
+  const host = runtime(session);
+  const raw = 'original output '.repeat(1000);
+  let original;
+  for (let turn = 1; turn <= 8; turn++) {
+    await host.next(turn);
+    if (turn === 4) {
+      original = result(session, turn, 'read_log', { query: 'needle' }, raw);
+      result(session, turn, 'check_log', {}, 'failed', true);
+    } else {
+      result(session, turn, 'check_log', { turn }, `result ${turn}`);
+    }
+    await finish(session, turn);
+  }
+  const restored = runtime(Session.create(session.id, session.snapshotEvents()));
+  const read = (ref, offset) => JSON.parse(restored.tool.execute({ action: 'read', ref, offset }, { agent: restored.agent }).text);
+  const ref = `T4S1:${original.seq}`;
+  const table = read('T4');
+  assert.equal(table.rows.length, 2);
+  assert.deepEqual(table.rows[0], { tool: 'read_log', input: '{"query":"needle"}', call: `T4S1:${original.seq - 1}`, result: ref });
+  assert.equal(read(table.rows[1].result).isError, true);
+  assert.equal(read(table.rows[0].call).text, table.rows[0].input);
+  assert.equal(read(ref).input, table.rows[0].input);
+  assert.equal(read(ref).text + read(ref, read(ref).nextOffset).text, raw);
+  assert.throws(() => read(`T5S1:${original.seq}`), /不匹配/);
+  assert.deepEqual(read().turns, { first: 5, last: 7 });
+  assert.equal(read().rows.length, 3);
+});
+
+test('filters by step and exact tool name and reads mixed refs independently', async () => {
+  const session = Session.create('session-history-filters');
+  const host = runtime(session);
+  await host.next(6);
+  const early = result(session, 6, 'read-log', { term: 'early' }, 'early output');
+  const late = result(session, 6, 'read-log', { term: 'late' }, 'late output '.repeat(900), false, 9);
+  result(session, 6, 'read-log-extra', {}, 'other output', false, 9);
+  await finish(session, 6);
+  const restored = runtime(Session.create(session.id, session.snapshotEvents()));
+  const read = (ref, offset) => JSON.parse(restored.tool.execute({ action: 'read', ref, offset }, { agent: restored.agent }).text);
+  const lateRef = `T6S9:${late.seq}`;
+  assert.deepEqual(read('T6-read-log').rows.map(row => row.result), [`T6S1:${early.seq}`, lateRef]);
+  assert.equal(read('T6S9').rows.length, 2);
+  assert.deepEqual(read('T6S9-read-log').rows.map(row => row.result), [lateRef]);
+  assert.deepEqual(read('T6S8-read-log').rows, []);
+  const batch = read(['T6S9-read-log', 'invalid', lateRef]).results;
+  assert.deepEqual(batch.map(row => row.ref), ['T6S9-read-log', 'invalid', lateRef]);
+  assert.deepEqual(batch[0].data, read('T6S9-read-log'));
+  assert.match(batch[1].error, /格式/);
+  assert.deepEqual(batch[2].data, read(lateRef));
+  assert.equal(read(lateRef, batch[2].data.nextOffset).offset, 8000);
+  assert.throws(() => read([lateRef], 1), /续读/);
+
+  assert.equal(read('T6-read-log').rows[0].output, undefined);
+  assert.deepEqual(read('T6-read-log-output').rows.map(row => row.result), [`T6S1:${early.seq}`, lateRef]);
+  const outputs = read('T6-output').rows;
+  assert.equal(outputs.length, 3);
+  assert.ok(outputs.every(row => !Object.hasOwn(row, 'input')));
+  assert.equal(outputs[0].output, 'early output');
+  assert.deepEqual(read('T6S9-output').rows, outputs.slice(1));
+  const [selected] = read('T6S9-read-log-output').rows;
+  assert.equal(selected.result, lateRef);
+  assert.equal(selected.output, read(lateRef).text);
+  assert.equal(selected.nextOffset, 8000);
+  assert.equal(selected.output + read(lateRef, selected.nextOffset).text, 'late output '.repeat(900));
+  assert.deepEqual(read(lateRef.replace(':', ';')), read(lateRef));
+  const mixed = read(['T6S9-read-log-output', 'T6-read-log-both', lateRef]).results;
+  assert.deepEqual(mixed[0].data.rows, [selected]);
+  assert.equal(mixed[1].data.rows[1].input, '{"term":"late"}');
+  assert.equal(mixed[1].data.rows[1].output, selected.output);
+  assert.equal(mixed[2].data.input, mixed[1].data.rows[1].input);
 });
 
 test('notebook survives metabolism and replay; updates, forgetting, budget and scope stay isolated', async () => {
@@ -133,7 +214,7 @@ test('notebook survives metabolism and replay; updates, forgetting, budget and s
   result(session, 1, host.tool.name, entry, '已写入全局注入。');
   assert.match(host.notebook(), /^超级注入（本会话的小本本）/);
   assert.deepEqual(JSON.parse(host.tool.execute({ action: 'notes' }, { agent: host.agent }).text).map(note => note.key), [entry.key]);
-  finish(session, 1);
+  await finish(session, 1);
   const next = await host.next(2);
   assert(!has(next, raw));
   assert(has(next, `[工具结果已代谢，原事件 ${original.seq}]`));
@@ -170,7 +251,7 @@ test('outbound projection retires stale notebook snapshots without removing othe
     ] },
   }), { surfaceOp: 'append' });
   changeMarks(host, 1, { ...entry, note: 'new notebook entry' });
-  finish(session, 1);
+  await finish(session, 1);
   const next = await host.next(2);
   assert(!JSON.stringify(next).includes(entry.note) || !next.some(m => m.source.kind === 'runtime-context' && JSON.stringify(m).includes(entry.note)));
   assert(next.some(m => m.source.kind === 'runtime-context' && m.content[0].text.endsWith('working directory')));
@@ -183,10 +264,10 @@ test('explicit history settlement replaces old short receipts and preserves the 
   const host = runtime(session);
   await host.next(1);
   const old = result(session, 1, 'read_log', {}, 'old receipt');
-  finish(session, 1);
+  await finish(session, 1);
   assert(has(await host.next(2), 'old receipt'));
   changeMarks(host, 2, { action: 'settle', includeHistory: true, summary: 'Historical cleanup requested.' });
-  finish(session, 2);
+  await finish(session, 2);
   assert(has(await host.next(3), `[工具结果已代谢，原事件 ${old.seq}]`));
   assert.equal(session.eventAt(old.seq).data.message.content[0].text, 'old receipt');
 });
@@ -203,14 +284,16 @@ test('projects the next request using native session replacement and preserves h
   assert.deepEqual(JSON.parse(list.text).map(row => row.seq), [original.seq, mark.seq]);
   changeMarks(host, 1, { action: 'mark', keep: [{ seq: mark.seq, reason: 'Compare exact results' }] });
   assert(has(session.deriveMessages(), raw));
-  finish(session, 1);
+  await finish(session, 1);
+  assert(!has(session.deriveMessages(), raw));
+  assert(has(session.deriveMessages(), `[工具结果已代谢，原事件 ${original.seq}]`));
   const second = await host.next(2);
   assert(!has(second, raw));
   assert(has(second, `[工具结果已代谢，原事件 ${original.seq}]`));
   assert(has(second, evidence));
   assert.equal(session.eventAt(original.seq).data.message.content[0].text, raw);
   assert.deepEqual(JSON.parse(session.eventAt(original.sourceEventSeqs[0]).data.arguments), { path: 'test.log' });
-  finish(session, 2);
+  await finish(session, 2);
   const third = await host.next(3);
   assert(!has(third, raw));
   assert(has(third, evidence));
@@ -219,18 +302,18 @@ test('projects the next request using native session replacement and preserves h
   assert.equal(marked.find(row => row.seq === mark.seq).reason, 'Compare exact results');
   assert.throws(() => changeMarks(host, 3, { action: 'release', seqs: [original.seq] }), /已有保留标注/);
   changeMarks(host, 3, { action: 'release', seqs: [mark.seq] });
-  finish(session, 3);
+  await finish(session, 3);
   const fourth = await host.next(4);
   assert(!has(fourth, evidence));
   assert(has(fourth, 'small'));
   host.disable();
   assert.equal(host.tool, undefined);
   host = runtime(session, false);
-  finish(session, 4);
+  await finish(session, 4);
   await host.next(5);
   const newRaw = 'new output '.repeat(200);
   result(session, 5, 'read_log', {}, newRaw);
-  finish(session, 5);
+  await finish(session, 5);
   const sixth = await host.next(6);
   assert(!has(sixth, raw));
   assert(!has(sixth, evidence));
@@ -248,7 +331,7 @@ test('reviews active marks every two turns and stops after release', async () =>
   assert.equal(host.review(), '');
   changeMarks(host, 1, { action: 'mark', keep: [{ seq: marked.seq, reason: 'Needed for comparison' }] });
   for (let turn = 2; turn <= 5; turn++) {
-    finish(session, turn - 1);
+    await finish(session, turn - 1);
     await host.next(turn);
     const expected = turn % 2 === 1;
     const prompt = host.review();
@@ -262,21 +345,21 @@ test('reviews active marks every two turns and stops after release', async () =>
   const later = result(session, 5, 'skill', {}, 'later body '.repeat(100));
   changeMarks(host, 5, { action: 'mark', keep: [{ seq: later.seq, reason: 'Still in use' }] });
   changeMarks(host, 5, { action: 'release', seqs: [marked.seq] });
-  finish(session, 5);
+  await finish(session, 5);
   await host.next(6);
   assert.equal(host.review(), '');
-  finish(session, 6);
+  await finish(session, 6);
   await host.next(7);
   assert(host.review().includes(`事件 ${later.seq}）`));
   changeMarks(host, 7, { action: 'release', seqs: [later.seq] });
-  finish(session, 7);
+  await finish(session, 7);
   await host.next(8);
-  finish(session, 8);
+  await finish(session, 8);
   await host.next(9);
   assert.equal(host.review(), '');
 });
 
-test('automatically catches up on results left by interrupted turns after replay', async () => {
+test('metabolizes errored and aborted turns at turn end and preserves replacements on replay', async () => {
   const session = Session.create('metabolism-test-failure');
   const host = runtime(session);
   await host.next(1);
@@ -285,12 +368,15 @@ test('automatically catches up on results left by interrupted turns after replay
   changeMarks(host, 1, { action: 'mark', keep: [{ seq: marked.seq, reason: 'Keep exact evidence' }] });
   const oldRaw = 'errored output '.repeat(200);
   const old = result(session, 1, 'read_log', {}, oldRaw);
-  finish(session, 1, 'error');
+  await finish(session, 1, 'error');
   session.append('turn/start', { turn: 2 });
   const recent = result(session, 2, 'read_log', {}, 'aborted output '.repeat(200));
-  finish(session, 2, 'aborted');
+  await finish(session, 2, 'aborted');
 
   const replayed = Session.create(session.id, session.snapshotEvents());
+  for (const event of [old, recent]) {
+    assert(has(replayed.deriveMessages(), `[工具结果已代谢，原事件 ${event.seq}]`));
+  }
   const resumed = runtime(replayed);
   const third = await resumed.next(3);
   for (const event of [old, recent]) {
@@ -302,7 +388,7 @@ test('automatically catches up on results left by interrupted turns after replay
   assert.equal(JSON.parse(read.text).text, oldRaw);
 
   changeMarks(resumed, 3, { action: 'release', seqs: [marked.seq] });
-  finish(replayed, 3);
+  await finish(replayed, 3);
   const fourth = await resumed.next(4);
   assert(has(fourth, `[工具结果已代谢，原事件 ${marked.seq}]`));
   assert(!has(fourth, evidence));
